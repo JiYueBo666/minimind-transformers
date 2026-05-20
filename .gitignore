@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Dataset (large files)
+dataset/*.jsonl
+dataset/*.bin
+dataset/.pretrain_shards/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+*:Zone.Identifier
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Training outputs
+outputs/
+swanlog/
+
+# Training outputs
+outputs/
+swanlog/

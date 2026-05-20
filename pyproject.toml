@@ -1,0 +1,13 @@
+[project]
+name = "minimind"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.13.0",
+    "datasets>=4.8.5",
+    "swanlab>=0.7.19",
+    "torch>=2.12.0",
+    "transformers>=5.8.1",
+]
