@@ -150,14 +150,20 @@ class MemoryCallback(TrainerCallback):
 class MiniMindTrainer(Trainer):
     """MoE 时把 router aux_loss 并入总 loss（Trainer 默认不处理 aux_loss）。"""
 
+    @staticmethod
+    def _unwrap(model) -> "MiniMindConfig":
+        """DDP 下模型被 DistributedDataParallel 包裹，须解包才能访问 .config。"""
+        return model.module if hasattr(model, "module") else model
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss
+        config = self._unwrap(model).config
         if (
             outputs.aux_loss is not None
-            and getattr(model.config, "router_aux_loss_coef", 0) > 0
+            and getattr(config, "router_aux_loss_coef", 0) > 0
         ):
-            loss = loss + model.config.router_aux_loss_coef * outputs.aux_loss
+            loss = loss + config.router_aux_loss_coef * outputs.aux_loss
         return (loss, outputs) if return_outputs else loss
 
 
