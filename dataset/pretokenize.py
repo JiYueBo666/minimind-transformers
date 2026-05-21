@@ -12,8 +12,10 @@ META_VERSION = 1
 
 def _get_tokenizer(path: str):
     """懒加载 tokenizer，避免 --show_scale --meta 时也需要 transformers。"""
+    import sys
+    sys.setrecursionlimit(10000)
     from transformers import AutoTokenizer
-    return _get_tokenizer(path)
+    return AutoTokenizer.from_pretrained(path)
 
 
 # 获取二进制文件对应的 meta.json 路径
