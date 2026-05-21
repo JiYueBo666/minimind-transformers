@@ -13,8 +13,10 @@ META_VERSION = 1
 def _get_tokenizer(path: str):
     """懒加载 tokenizer，避免 --show_scale --meta 时也需要 transformers。"""
     import sys
+
     sys.setrecursionlimit(10000)
     from transformers import AutoTokenizer
+
     return AutoTokenizer.from_pretrained(path)
 
 
@@ -363,7 +365,7 @@ if __name__ == "__main__":
         "--jsonl",
         type=str,
         help="输入 JSONL 文件路径",
-        default="/root/code/minimind/dataset/pretrain_t2t_mini.jsonl",
+        default="/root/code/minimind/dataset/pretrain_t2t.jsonl",
     )
     parser.add_argument(
         "--out_bin", type=str, default="pretrain.bin", help="输出二进制文件路径"

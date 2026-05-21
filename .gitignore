@@ -29,6 +29,6 @@ Thumbs.db
 outputs/
 swanlog/
 
-# Training outputs
-outputs/
-swanlog/
+# Root-level pretokenize output (run from project root)
+/pretrain.bin
+/pretrain.meta.json

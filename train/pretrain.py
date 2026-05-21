@@ -3,12 +3,12 @@ MiniMind 预训练：bin + PretrainDataset + Transformers Trainer。
 """
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +39,7 @@ def parse_args():
     )
     parser.add_argument("--stride", type=int, default=None, help="默认等于 max_length")
     # 模型
-    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_hidden_layers", type=int, default=8)
     parser.add_argument("--use_moe", action="store_true")
     # 训练（单卡 8GB 默认偏保守）
@@ -65,9 +65,14 @@ def parse_args():
         action="store_true",
         help="只跑一个 batch forward，不启动 Trainer",
     )
-    parser.add_argument("--use_wandb", action="store_true", help="启用 wandb 实验追踪")
     parser.add_argument(
-        "--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb 项目名"
+        "--use_swanlab", action="store_true", help="启用 SwanLab 实验追踪"
+    )
+    parser.add_argument(
+        "--swanlab_project",
+        type=str,
+        default="MiniMind-Pretrain-30M",
+        help="SwanLab 项目名",
     )
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     return parser.parse_args()
@@ -98,7 +103,7 @@ def collate_batch(
 
 
 def validate_meta(data_bin: Path, max_length: int) -> None:
-    """修改: 训练前校验 meta，避免 max_length 与 pretokenize 不一致。"""
+    """训练前校验 meta，避免 max_length 与 pretokenize 不一致。"""
     meta_file = meta_path_for(data_bin)
     if not meta_file.exists():
         return
@@ -109,11 +114,18 @@ def validate_meta(data_bin: Path, max_length: int) -> None:
             f"max_length={max_length} 与 meta.max_tokens_per_doc={doc_max} 不一致，"
             "请重新 pretokenize 或改 --max_length"
         )
-    if is_main_process():
-        print(
-            f"meta: num_tokens={meta['num_tokens']:,}, "
-            f"num_samples={meta.get('num_samples', '?')}, dtype={meta['dtype']}"
-        )
+    print(
+        f"meta: num_tokens={meta['num_tokens']:,}, "
+        f"num_samples={meta.get('num_samples', '?')}, dtype={meta['dtype']}"
+    )
+
+
+class CorrectLossCallback(TrainerCallback):
+    """修正 Trainer 报告的 loss：除以 gradient_accumulation_steps 以消除缩放误差。"""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs and args.gradient_accumulation_steps > 1:
+            logs["loss"] = logs["loss"] / args.gradient_accumulation_steps
 
 
 class MemoryCallback(TrainerCallback):
@@ -126,15 +138,17 @@ class MemoryCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if not self._done and state.global_step >= 1:
             self._done = True
-            gpu_memory_summary(
-                kwargs.get("model"),
-                self._batch,
-                prefix=f"step {state.global_step}",
-            )
+            model = kwargs.get("model")
+            if model is not None:
+                gpu_memory_summary(
+                    model,
+                    self._batch,
+                    prefix=f"step {state.global_step}",
+                )
 
 
 class MiniMindTrainer(Trainer):
-    """修改: MoE 时把 router aux_loss 并入总 loss（原先 smoke_forward 有，Trainer 默认没有）。"""
+    """MoE 时把 router aux_loss 并入总 loss（Trainer 默认不处理 aux_loss）。"""
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -159,13 +173,12 @@ def smoke_forward(model, batch: dict[str, torch.Tensor], device: torch.device) -
 
 
 def build_training_args(args: argparse.Namespace) -> TrainingArguments:
-    """修改: 全部来自 CLI，CPU 自动关 bf16。"""
     use_cuda = "cuda" in args.device and torch.cuda.is_available()
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
 
-    # swanlab 检测：仅在显式启用且库可用时开启
+    # SwanLab 检测：仅在显式启用且库可用时开启
     report_to = "none"
-    if args.use_wandb:
+    if args.use_swanlab:
         try:
             import swanlab  # noqa: F401
 
@@ -192,8 +205,8 @@ def build_training_args(args: argparse.Namespace) -> TrainingArguments:
         report_to=report_to,
         save_total_limit=3,
         lr_scheduler_type="cosine",
-        run_name=args.wandb_project if args.use_wandb else None,
-        ddp_find_unused_parameters=True,
+        run_name=args.swanlab_project if args.use_swanlab else None,
+        ddp_find_unused_parameters=torch.distributed.is_initialized(),
     )
 
 
@@ -233,8 +246,6 @@ def main():
         print(f"dataset mode: {dataset.mode}, len: {len(dataset):,}")
 
     if args.smoke_test:
-        from torch.utils.data import DataLoader
-
         # DDP 下只有 rank 0 跑冒烟测试
         local_device = device
         if torch.distributed.is_initialized():
@@ -275,22 +286,24 @@ def main():
     # 在主进程上创建 callback 用 sample_batch
     sample_batch = None
     if is_main_process():
-        from torch.utils.data import DataLoader
-
         sample_loader = DataLoader(
-            dataset, batch_size=args.batch_size, collate_fn=collate_batch,
+            dataset,
+            batch_size=args.batch_size,
+            collate_fn=collate_batch,
         )
         sample_batch = next(iter(sample_loader))
         del sample_loader
 
-    callbacks = [MemoryCallback(sample_batch)] if sample_batch is not None else None
-    trainer_cls = MiniMindTrainer if args.use_moe else Trainer
-    trainer = trainer_cls(
+    trainer = MiniMindTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=collate_batch,
-        callbacks=callbacks,
+        callbacks=(
+            [CorrectLossCallback(), MemoryCallback(sample_batch)]
+            if sample_batch is not None
+            else [CorrectLossCallback()]
+        ),
     )
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
