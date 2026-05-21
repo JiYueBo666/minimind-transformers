@@ -1,17 +1,26 @@
+from __future__ import annotations
+
 import json
 import argparse
 import numpy as np
 from pathlib import Path
 from typing import Optional
 from multiprocessing import Pool
-from transformers import AutoTokenizer
 
 META_VERSION = 1
+
+
+def _get_tokenizer(path: str):
+    """懒加载 tokenizer，避免 --show_scale --meta 时也需要 transformers。"""
+    from transformers import AutoTokenizer
+    return _get_tokenizer(path)
+
 
 # 获取二进制文件对应的 meta.json 路径
 def meta_path_for(bin_path: str | Path) -> Path:
     p = Path(bin_path)
     return p.with_name(p.stem + ".meta.json")
+
 
 # 写入元数据信息到 meta.json 文件
 def write_meta(
@@ -52,10 +61,11 @@ def write_meta(
         json.dump(meta, f, ensure_ascii=False, indent=2)
     tmp.replace(path)
 
+
 # 编码文本，添加 BOS/EOS，截断
 def _encode_text(
     text: str,
-    tokenizer: AutoTokenizer,
+    tokenizer,
     max_tokens: Optional[int],
 ) -> list[int]:
     """
@@ -70,8 +80,11 @@ def _encode_text(
             ids = ids[:content_max]
     return [tokenizer.bos_token_id] + ids + [tokenizer.eos_token_id]
 
+
 # 处理一行 JSONL，返回 token id 列表
-def _process_line(line: str, tokenizer: AutoTokenizer, max_tokens: Optional[int]) -> Optional[list[int]]:
+def _process_line(
+    line: str, tokenizer, max_tokens: Optional[int]
+) -> Optional[list[int]]:
     line = line.strip()
     if not line:
         return None
@@ -84,11 +97,12 @@ def _process_line(line: str, tokenizer: AutoTokenizer, max_tokens: Optional[int]
         return None
     return _encode_text(text, tokenizer, max_tokens)
 
+
 # 单进程预分词主流程：按行读取，编码成 token id，缓冲写入
 def pretokenize_jsonl(
     jsonl_path: str,
     out_bin: str,
-    tokenizer: AutoTokenizer,
+    tokenizer,
     max_tokens: Optional[int] = None,
     dtype: np.dtype = np.uint16,
     buffer_size: int = 1_000_000,
@@ -154,6 +168,7 @@ def pretokenize_jsonl(
 
     return total_tokens, total_samples
 
+
 # 构建每一行对应的字节偏移数组（用于多进程分片定位）
 def build_line_offsets(jsonl_path: str, verbose: bool = True) -> tuple[np.ndarray, int]:
     """
@@ -174,6 +189,7 @@ def build_line_offsets(jsonl_path: str, verbose: bool = True) -> tuple[np.ndarra
         print(f"行索引: {len(offsets):,} 行, 文件 {mb:.1f} MB")
     return np.array(offsets, dtype=np.uint64), file_size
 
+
 # 单 worker 子进程入口：处理对应字节区间
 def _worker_pretokenize(args: tuple) -> tuple[str, int, int]:
     """子进程：seek 到 [byte_start, byte_end) 字节区间，只读本分片。"""
@@ -187,7 +203,7 @@ def _worker_pretokenize(args: tuple) -> tuple[str, int, int]:
         dtype_name,
     ) = args
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = _get_tokenizer(tokenizer_path)
     dtype = np.dtype(dtype_name)
     tmp = Path(shard_bin).with_suffix(".tmp")
     total_tokens = 0
@@ -215,6 +231,7 @@ def _worker_pretokenize(args: tuple) -> tuple[str, int, int]:
     tmp.replace(shard_bin)
     return shard_bin, total_tokens, total_samples
 
+
 # 多进程并行预分词流程
 def pretokenize_jsonl_parallel(
     jsonl_path: str,
@@ -227,7 +244,7 @@ def pretokenize_jsonl_parallel(
 ) -> tuple[int, int]:
     # 对于单进程直接用 pretokenize_jsonl
     if num_workers < 2:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        tokenizer = _get_tokenizer(tokenizer_path)
         return pretokenize_jsonl(
             jsonl_path, out_bin, tokenizer, max_tokens, dtype, verbose=verbose
         )
@@ -242,7 +259,9 @@ def pretokenize_jsonl_parallel(
     offsets, file_size = build_line_offsets(jsonl_path, verbose=verbose)
     num_lines = len(offsets)
     if verbose:
-        print(f"共 {num_lines:,} 行，使用 {num_workers} 进程（各 worker 仅读自己的分片）")
+        print(
+            f"共 {num_lines:,} 行，使用 {num_workers} 进程（各 worker 仅读自己的分片）"
+        )
 
     chunk = (num_lines + num_workers - 1) // num_workers
     tasks = []
@@ -302,18 +321,54 @@ def pretokenize_jsonl_parallel(
 
     return total_tokens, total_samples
 
+
+# ─── 缩放法则 ───
+
+
+def compute_chinchilla_scale(num_tokens: int) -> dict:
+    """
+    基于 Chinchilla 缩放法则（20 tokens / 参数），给出推荐模型规模。
+    """
+    tokens_b = num_tokens / 1e9
+    optimal_params = num_tokens / 20  # Chinchilla optimal
+    return {
+        "tokens_b": tokens_b,
+        "optimal_params_m": optimal_params / 1e6,
+    }
+
+
+def print_chinchilla_recommendation(num_tokens: int) -> None:
+    """打印 Chinchilla 缩放法则分析和模型参数量建议。"""
+    rec = compute_chinchilla_scale(num_tokens)
+    print(f"\n{'=' * 60}")
+    print(f"  缩放法则分析 (Chinchilla)")
+    print(f"{'=' * 60}")
+    print(f"  总 token 数:       {num_tokens:,} ({rec['tokens_b']:.2f}B)")
+    print(f"  最优参数量:        ~{rec['optimal_params_m']:.0f}M")
+    print(f"  Chinchilla 公式:   参数量 ≈ token数 / 20")
+    print(f"{'=' * 60}\n")
+
+
 # 主入口，命令行解析
 if __name__ == "__main__":
     import time
+
     start_time = time.time()
     parser = argparse.ArgumentParser(
         description="将 JSONL 预编码为 token 二进制（与 PretrainDataset 的 BOS/EOS 逻辑一致）"
     )
-    parser.add_argument("--jsonl", type=str, help="输入 JSONL 文件路径",default='/root/code/minimind/dataset/pretrain_t2t.jsonl')
+    parser.add_argument(
+        "--jsonl",
+        type=str,
+        help="输入 JSONL 文件路径",
+        default="/root/code/minimind/dataset/pretrain_t2t_mini.jsonl",
+    )
     parser.add_argument(
         "--out_bin", type=str, default="pretrain.bin", help="输出二进制文件路径"
     )
-    parser.add_argument("--tokenizer_path", type=str, default='/root/code/minimind/tokenizer')
+    parser.add_argument(
+        "--tokenizer_path", type=str, default="/root/code/minimind/tokenizer"
+    )
     parser.add_argument(
         "--max_tokens",
         type=int,
@@ -342,16 +397,28 @@ if __name__ == "__main__":
         help="meta.json 路径，默认与 out_bin 同目录下的 <stem>.meta.json",
     )
     parser.add_argument("--no_verbose", action="store_true")
+    parser.add_argument(
+        "--show_scale",
+        action="store_true",
+        help="显示基于 Chinchilla 缩放法则的推荐模型参数量（可单独与 --meta 使用）",
+    )
 
     args = parser.parse_args()
     verbose = not args.no_verbose
+
+    # --show_scale 可以单独读取现有 meta 使用
+    if args.show_scale and args.meta is not None:
+        with open(args.meta, encoding="utf-8") as f:
+            meta = json.load(f)
+        print_chinchilla_recommendation(meta["num_tokens"])
+        raise SystemExit(0)
 
     dtype_map = {"uint16": np.uint16, "uint32": np.uint32, "int32": np.int32}
     dtype = dtype_map[args.dtype]
 
     # 加载分词器
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        tokenizer = _get_tokenizer(args.tokenizer_path)
     except Exception as e:
         print(f"加载 tokenizer 失败: {e}")
         raise SystemExit(1) from e
@@ -396,5 +463,9 @@ if __name__ == "__main__":
     )
     if verbose:
         print(f"meta: {meta_out}")
+
+    if args.show_scale:
+        print_chinchilla_recommendation(total_tokens)
+
     end_time = time.time()
     print(f"Processing time: {end_time - start_time:.2f} seconds")
