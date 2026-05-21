@@ -4,17 +4,26 @@ MiniMind 预训练：bin + PretrainDataset + Transformers Trainer。
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from dataset.lm_dataset import PretrainDataset, load_bin_meta, meta_path_for
 from model.model import MiniMindConfig, MiniMindForCausalLM
+from train.memory_utils import gpu_memory_summary, reset_peak_memory
+
+
+def is_main_process() -> bool:
+    """DDP 下只在 rank 0 打印/校验。"""
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
 
 
 def parse_args():
@@ -41,7 +50,7 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--max_steps", type=int, default=10_000)
+    parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=100)
@@ -100,10 +109,28 @@ def validate_meta(data_bin: Path, max_length: int) -> None:
             f"max_length={max_length} 与 meta.max_tokens_per_doc={doc_max} 不一致，"
             "请重新 pretokenize 或改 --max_length"
         )
-    print(
-        f"meta: num_tokens={meta['num_tokens']:,}, "
-        f"num_samples={meta.get('num_samples', '?')}, dtype={meta['dtype']}"
-    )
+    if is_main_process():
+        print(
+            f"meta: num_tokens={meta['num_tokens']:,}, "
+            f"num_samples={meta.get('num_samples', '?')}, dtype={meta['dtype']}"
+        )
+
+
+class MemoryCallback(TrainerCallback):
+    """Trainer 回调：第一个 step 完成后打印显存明细。"""
+
+    def __init__(self, batch: dict[str, torch.Tensor]):
+        self._batch = batch
+        self._done = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self._done and state.global_step >= 1:
+            self._done = True
+            gpu_memory_summary(
+                kwargs.get("model"),
+                self._batch,
+                prefix=f"step {state.global_step}",
+            )
 
 
 class MiniMindTrainer(Trainer):
@@ -144,8 +171,9 @@ def build_training_args(args: argparse.Namespace) -> TrainingArguments:
 
             report_to = "swanlab"
         except ImportError:
-            print("[swanlab] 未安装，回退 report_to=none")
-            print("[swanlab] 安装: pip install swanlab")
+            if is_main_process():
+                print("[swanlab] 未安装，回退 report_to=none")
+                print("[swanlab] 安装: pip install swanlab")
 
     return TrainingArguments(
         output_dir=args.output_dir,
@@ -153,7 +181,7 @@ def build_training_args(args: argparse.Namespace) -> TrainingArguments:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        max_steps=args.max_steps,
+        num_train_epochs=args.epochs,
         warmup_steps=args.warmup_steps,
         bf16=use_bf16,
         fp16=use_cuda and not use_bf16,
@@ -165,6 +193,7 @@ def build_training_args(args: argparse.Namespace) -> TrainingArguments:
         save_total_limit=3,
         lr_scheduler_type="cosine",
         run_name=args.wandb_project if args.use_wandb else None,
+        ddp_find_unused_parameters=True,
     )
 
 
@@ -179,10 +208,10 @@ def main():
             f"找不到 {data_bin}，请先运行: python dataset/pretokenize.py ..."
         )
 
-    validate_meta(data_bin, args.max_length)
-
-    print(f"device: {device}")
-    print(f"data: {data_bin.resolve()}")
+    if is_main_process():
+        validate_meta(data_bin, args.max_length)
+        print(f"device: {device}")
+        print(f"data: {data_bin.resolve()}")
 
     tokenizer, model = init_model(
         args.tokenizer_path,
@@ -191,20 +220,30 @@ def main():
         args.use_moe,
     )
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model params: {n_params / 1e6:.2f}M, use_moe: {args.use_moe}")
+    if is_main_process():
+        print(f"model params: {n_params / 1e6:.2f}M, use_moe: {args.use_moe}")
+        gpu_memory_summary(model, prefix="模型初始化")
 
     dataset = PretrainDataset(
         str(data_bin),
         max_length=args.max_length,
         stride=stride,
     )
-    print(f"dataset mode: {dataset.mode}, len: {len(dataset):,}")
+    if is_main_process():
+        print(f"dataset mode: {dataset.mode}, len: {len(dataset):,}")
 
     if args.smoke_test:
-        # 修改: 保留冒烟路径，与 Trainer 训练分离
         from torch.utils.data import DataLoader
 
-        model = model.to(device)
+        # DDP 下只有 rank 0 跑冒烟测试
+        local_device = device
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+            local_device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+
+        model = model.to(local_device)
+        reset_peak_memory()
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -213,31 +252,54 @@ def main():
             collate_fn=collate_batch,
             drop_last=True,
         )
-        batch = next(iter(loader))  # 修改: loader 已含 collate_fn，勿重复 collate
-        loss = smoke_forward(model, batch, device)
-        print(f"smoke loss: {loss:.4f} (OK)")
+        batch = next(iter(loader))
+        gpu_memory_summary(model, batch, prefix="冒烟测试 forward 前")
+        loss = smoke_forward(model, batch, local_device)
+        gpu_memory_summary(model, batch, prefix="冒烟测试 forward 后")
+        if is_main_process():
+            print(f"smoke loss: {loss:.4f} (OK)")
         return
 
     training_args = build_training_args(args)
     effective_batch = args.batch_size * args.gradient_accumulation_steps
-    print(
-        f"train: batch_size={args.batch_size}, accum={args.gradient_accumulation_steps}, "
-        f"effective_batch={effective_batch}, max_steps={args.max_steps}, bf16={training_args.bf16}"
-    )
+    if is_main_process():
+        print(
+            f"train: batch_size={args.batch_size}, accum={args.gradient_accumulation_steps}, "
+            f"effective_batch={effective_batch}, epochs={args.epochs}, "
+            f"steps_per_epoch≈{len(dataset) // max(1, effective_batch):,}, bf16={training_args.bf16}"
+        )
 
-    # 修改: 不要先 model.to(device)，交给 Trainer 统一放置
+    # 不要先 model.to(device)，交给 Trainer 统一放置
+    reset_peak_memory()
+
+    # 在主进程上创建 callback 用 sample_batch
+    sample_batch = None
+    if is_main_process():
+        from torch.utils.data import DataLoader
+
+        sample_loader = DataLoader(
+            dataset, batch_size=args.batch_size, collate_fn=collate_batch,
+        )
+        sample_batch = next(iter(sample_loader))
+        del sample_loader
+
+    callbacks = [MemoryCallback(sample_batch)] if sample_batch is not None else None
     trainer_cls = MiniMindTrainer if args.use_moe else Trainer
     trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=collate_batch,
+        callbacks=callbacks,
     )
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"done. weights saved to {args.output_dir}")
+
+    if is_main_process():
+        gpu_memory_summary(prefix="训练结束（峰值）")
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        print(f"done. weights saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
