@@ -2,11 +2,21 @@
 set -e
 
 # ─── 单卡 ───
-python train/pretrain.py \
+# python train/pretrain.py \
+#   --data_bin dataset/pretrain_full.bin \
+#   --hidden_size 512 \
+#   --num_hidden_layers 8 \
+#   --batch_size 32 \
+#   --gradient_accumulation_steps 16 \
+#   --epochs 4 \
+#   --use_swanlab
+
+# ─── 双卡 DDP ───
+torchrun --nproc_per_node=2 train/pretrain.py \
   --data_bin dataset/pretrain_full.bin \
   --hidden_size 512 \
   --num_hidden_layers 8 \
   --batch_size 32 \
-  --gradient_accumulation_steps 16 \
+  --gradient_accumulation_steps 8 \
   --epochs 4 \
   --use_swanlab
